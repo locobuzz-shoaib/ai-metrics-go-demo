@@ -19,6 +19,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -29,6 +30,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/locobuzz-solutions/creatorverse-ai-token-metrics-service/backoff"
 	"github.com/locobuzz-solutions/creatorverse-ai-token-metrics-service/config"
 	"github.com/locobuzz-solutions/creatorverse-ai-token-metrics-service/consumer"
 	"github.com/locobuzz-solutions/creatorverse-ai-token-metrics-service/storage"
@@ -80,7 +82,7 @@ func main() {
 		batchTimer = time.NewTimer(time.Duration(cfg.BatchTimeoutMs) * time.Millisecond)
 	)
 
-	// Flush batch function
+	// Flush batch function with retry logic
 	flushBatch := func() {
 		batchMutex.Lock()
 		if len(batch) == 0 {
@@ -91,15 +93,47 @@ func main() {
 		batch = make([]*consumer.TokenUsageEvent, 0, cfg.BatchSize)
 		batchMutex.Unlock()
 
-		if err := store.InsertBatch(ctx, toFlush); err != nil {
-			log.Printf("Failed to insert batch (%d events): %v", len(toFlush), err)
-		} else {
+		// Use a fresh context for flush (not the cancelled main context)
+		flushCtx, flushCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer flushCancel()
+
+		// Retry with exponential backoff
+		retryBackoff := backoff.New(backoff.RetryConfig())
+		var lastErr error
+
+		for attempt := 1; attempt <= 4; attempt++ { // 1 initial + 3 retries
+			if err := store.InsertBatch(flushCtx, toFlush); err != nil {
+				lastErr = err
+				log.Printf("Batch insert failed (attempt %d/4, %d events): %v", attempt, len(toFlush), err)
+
+				if attempt < 4 {
+					delay := retryBackoff.Duration()
+					log.Printf("Retrying in %v...", delay)
+					if !retryBackoff.Wait(flushCtx) {
+						log.Printf("Retry cancelled or timed out")
+						break
+					}
+				}
+				continue
+			}
+
+			// Success
 			log.Printf("Inserted batch of %d events", len(toFlush))
+			return
 		}
+
+		// All retries failed - log critical error
+		log.Printf("CRITICAL: Failed to insert batch (%d events) after all retries: %v", len(toFlush), lastErr)
+		// Events are lost at this point - in production, consider writing to dead-letter file
 	}
 
+	// WaitGroup for graceful shutdown
+	var wg sync.WaitGroup
+
 	// Background batch flusher
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-ctx.Done():
@@ -111,11 +145,14 @@ func main() {
 		}
 	}()
 
-	// Main consume loop
+	// Main consume loop with proper error handling and backoff
 	log.Printf("Starting to consume messages...")
 	messagesProcessed := 0
+	kafkaBackoff := backoff.New(backoff.DefaultConfig())
 
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-ctx.Done():
@@ -132,8 +169,25 @@ func main() {
 				if ctx.Err() != nil {
 					return
 				}
+
+				// Log error with context
+				if errors.Is(err, context.DeadlineExceeded) {
+					// Timeout is normal when no messages - reset backoff but don't log every time
+					kafkaBackoff.Reset()
+				} else {
+					// Real error - log and apply backoff
+					log.Printf("Kafka read error (attempt %d): %v", kafkaBackoff.Attempts()+1, err)
+
+					if !kafkaBackoff.Wait(ctx) {
+						// Context cancelled during backoff
+						return
+					}
+				}
 				continue
 			}
+
+			// Success - reset backoff
+			kafkaBackoff.Reset()
 
 			// Add to batch
 			batchMutex.Lock()
@@ -155,16 +209,38 @@ func main() {
 
 	// Wait for shutdown signal
 	sig := <-sigCh
-	log.Printf("Received signal %v, shutting down...", sig)
+	log.Printf("Received signal %v, initiating graceful shutdown...", sig)
+
+	// Cancel context to signal goroutines to stop
 	cancel()
 
-	// Flush remaining events
+	// Wait for consumer goroutine to exit with timeout
+	shutdownComplete := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(shutdownComplete)
+	}()
+
+	select {
+	case <-shutdownComplete:
+		log.Printf("All goroutines stopped")
+	case <-time.After(10 * time.Second):
+		log.Printf("WARNING: Timeout waiting for goroutines to stop")
+	}
+
+	// Stop the batch timer
+	batchTimer.Stop()
+
+	// Flush remaining events (uses fresh context internally)
+	log.Printf("Flushing remaining events...")
 	flushBatch()
 
 	// Shutdown health server
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
-	healthServer.Shutdown(shutdownCtx)
+	if err := healthServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Health server shutdown error: %v", err)
+	}
 
 	log.Printf("%s stopped. Total messages processed: %d", cfg.ServiceName, messagesProcessed)
 }
