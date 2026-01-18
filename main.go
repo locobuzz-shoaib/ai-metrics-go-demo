@@ -9,12 +9,13 @@
 //   - Kafka consumer with consumer group support
 //   - Batch inserts to ClickHouse for efficiency
 //   - Graceful shutdown handling
-//   - Health check endpoint
+//   - Structured logging with trace IDs
 //
 // Usage:
-//   ./creatorverse-ai-token-metrics-service
-//   # Or with a different config file:
-//   ./creatorverse-ai-token-metrics-service -config /path/to/appsettings.json
+//
+//	./creatorverse-ai-token-metrics-service
+//	# Or with a different config file:
+//	./creatorverse-ai-token-metrics-service -config /path/to/appsettings.json
 package main
 
 import (
@@ -22,19 +23,21 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
 
+	"github.com/locobuzz-shoaib/cv-go-common-package/pkg/logger"
+
 	"github.com/locobuzz-solutions/creatorverse-ai-token-metrics-service/backoff"
 	"github.com/locobuzz-solutions/creatorverse-ai-token-metrics-service/config"
 	"github.com/locobuzz-solutions/creatorverse-ai-token-metrics-service/consumer"
 	"github.com/locobuzz-solutions/creatorverse-ai-token-metrics-service/storage"
 )
+
+var log *logger.Logger
 
 func main() {
 	// Parse command line flags
@@ -44,36 +47,52 @@ func main() {
 	// Load configuration from appsettings.json
 	cfg, err := config.LoadConfigFromFile(*configFile)
 	if err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
+		fmt.Printf("Failed to load configuration: %v\n", err)
+		os.Exit(1)
 	}
 
-	log.Printf("Starting %s", cfg.ServiceName)
-	log.Printf("Environment: %s", cfg.Environ)
-	log.Printf("Kafka brokers: %v", cfg.KafkaBrokers)
-	log.Printf("Kafka topic: %s", cfg.KafkaTopic)
-	log.Printf("ClickHouse: %s/%s", cfg.ClickHouseAddr(), cfg.ClickHouseDatabase)
-	log.Printf("Batch size: %d, timeout: %dms", cfg.BatchSize, cfg.BatchTimeoutMs)
+	// Initialize structured logger from common package
+	log = logger.New(logger.Config{
+		ServiceName: cfg.ServiceName,
+		Environment: cfg.Environ,
+		Level:       logger.ParseLevel(cfg.LogLevel),
+		LogType:     logger.LogTypeJSON,
+	})
+	logger.SetDefault(log)
+
+	// Create context with trace ID
+	ctx := context.Background()
+	ctx, traceID := logger.EnsureTraceID(ctx, "aitm")
+
+	log.Info("Starting service",
+		"trace_id", traceID,
+		"environment", cfg.Environ,
+		"kafka_brokers", cfg.KafkaBrokers,
+		"kafka_topic", cfg.KafkaTopic,
+		"clickhouse_addr", cfg.ClickHouseAddr(),
+		"clickhouse_database", cfg.ClickHouseDatabase,
+		"batch_size", cfg.BatchSize,
+		"batch_timeout_ms", cfg.BatchTimeoutMs,
+	)
 
 	// Initialize ClickHouse storage
-	store, err := storage.NewClickHouseStorage(cfg)
+	store, err := storage.NewClickHouseStorage(cfg, log)
 	if err != nil {
-		log.Fatalf("Failed to connect to ClickHouse: %v", err)
+		log.Error("Failed to connect to ClickHouse", "error", err)
+		os.Exit(1)
 	}
 	defer store.Close()
 
 	// Initialize Kafka consumer
-	kafkaConsumer := consumer.NewKafkaConsumer(cfg)
+	kafkaConsumer := consumer.NewKafkaConsumer(cfg, log)
 	defer kafkaConsumer.Close()
 
 	// Setup graceful shutdown
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	// Start health check server
-	healthServer := startHealthServer(cfg.HealthCheckPort)
 
 	// Event batch for bulk inserts
 	var (
@@ -97,33 +116,52 @@ func main() {
 		flushCtx, flushCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer flushCancel()
 
+		// Add trace ID to flush context
+		flushCtx, flushTraceID := logger.EnsureTraceID(flushCtx, "flush")
+
 		// Retry with exponential backoff
 		retryBackoff := backoff.New(backoff.RetryConfig())
 		var lastErr error
 
 		for attempt := 1; attempt <= 4; attempt++ { // 1 initial + 3 retries
+			start := time.Now()
 			if err := store.InsertBatch(flushCtx, toFlush); err != nil {
 				lastErr = err
-				log.Printf("Batch insert failed (attempt %d/4, %d events): %v", attempt, len(toFlush), err)
+				log.Warn("Batch insert failed",
+					"trace_id", flushTraceID,
+					"attempt", attempt,
+					"max_attempts", 4,
+					"event_count", len(toFlush),
+					"error", err,
+				)
 
 				if attempt < 4 {
 					delay := retryBackoff.Duration()
-					log.Printf("Retrying in %v...", delay)
+					log.Debug("Retrying batch insert",
+						"trace_id", flushTraceID,
+						"delay", delay,
+					)
 					if !retryBackoff.Wait(flushCtx) {
-						log.Printf("Retry cancelled or timed out")
+						log.Warn("Retry cancelled or timed out", "trace_id", flushTraceID)
 						break
 					}
 				}
 				continue
 			}
 
-			// Success
-			log.Printf("Inserted batch of %d events", len(toFlush))
+			// Success - log with performance metrics
+			log.LogPerformance(flushCtx, "batch_insert", time.Since(start),
+				"event_count", len(toFlush),
+			)
 			return
 		}
 
 		// All retries failed - log critical error
-		log.Printf("CRITICAL: Failed to insert batch (%d events) after all retries: %v", len(toFlush), lastErr)
+		log.Error("CRITICAL: Failed to insert batch after all retries",
+			"trace_id", flushTraceID,
+			"event_count", len(toFlush),
+			"error", lastErr,
+		)
 		// Events are lost at this point - in production, consider writing to dead-letter file
 	}
 
@@ -146,7 +184,7 @@ func main() {
 	}()
 
 	// Main consume loop with proper error handling and backoff
-	log.Printf("Starting to consume messages...")
+	log.Info("Starting message consumption")
 	messagesProcessed := 0
 	kafkaBackoff := backoff.New(backoff.DefaultConfig())
 
@@ -176,7 +214,10 @@ func main() {
 					kafkaBackoff.Reset()
 				} else {
 					// Real error - log and apply backoff
-					log.Printf("Kafka read error (attempt %d): %v", kafkaBackoff.Attempts()+1, err)
+					log.Warn("Kafka read error",
+						"attempt", kafkaBackoff.Attempts()+1,
+						"error", err,
+					)
 
 					if !kafkaBackoff.Wait(ctx) {
 						// Context cancelled during backoff
@@ -202,14 +243,18 @@ func main() {
 
 			messagesProcessed++
 			if messagesProcessed%1000 == 0 {
-				log.Printf("Processed %d messages", messagesProcessed)
+				log.Info("Processing progress",
+					"messages_processed", messagesProcessed,
+				)
 			}
 		}
 	}()
 
 	// Wait for shutdown signal
 	sig := <-sigCh
-	log.Printf("Received signal %v, initiating graceful shutdown...", sig)
+	log.Info("Received shutdown signal, initiating graceful shutdown",
+		"signal", sig.String(),
+	)
 
 	// Cancel context to signal goroutines to stop
 	cancel()
@@ -223,51 +268,19 @@ func main() {
 
 	select {
 	case <-shutdownComplete:
-		log.Printf("All goroutines stopped")
+		log.Info("All goroutines stopped")
 	case <-time.After(10 * time.Second):
-		log.Printf("WARNING: Timeout waiting for goroutines to stop")
+		log.Warn("Timeout waiting for goroutines to stop")
 	}
 
 	// Stop the batch timer
 	batchTimer.Stop()
 
 	// Flush remaining events (uses fresh context internally)
-	log.Printf("Flushing remaining events...")
+	log.Info("Flushing remaining events")
 	flushBatch()
 
-	// Shutdown health server
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-	if err := healthServer.Shutdown(shutdownCtx); err != nil {
-		log.Printf("Health server shutdown error: %v", err)
-	}
-
-	log.Printf("%s stopped. Total messages processed: %d", cfg.ServiceName, messagesProcessed)
-}
-
-// startHealthServer starts an HTTP server for health checks
-func startHealthServer(port int) *http.Server {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
-	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Ready"))
-	})
-
-	server := &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
-		Handler: mux,
-	}
-
-	go func() {
-		log.Printf("Health check server listening on port %d", port)
-		if err := server.ListenAndServe(); err != http.ErrServerClosed {
-			log.Printf("Health server error: %v", err)
-		}
-	}()
-
-	return server
+	log.Info("Service stopped",
+		"total_messages_processed", messagesProcessed,
+	)
 }

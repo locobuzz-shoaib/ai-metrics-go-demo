@@ -5,23 +5,25 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/locobuzz-shoaib/cv-go-common-package/pkg/logger"
+
 	"github.com/locobuzz-solutions/creatorverse-ai-token-metrics-service/config"
 	"github.com/locobuzz-solutions/creatorverse-ai-token-metrics-service/consumer"
 )
 
 // ClickHouseStorage handles storage of token usage events in ClickHouse
 type ClickHouseStorage struct {
-	db  *sql.DB
-	cfg *config.Config
+	db     *sql.DB
+	cfg    *config.Config
+	logger *logger.Logger
 }
 
 // NewClickHouseStorage creates a new ClickHouse storage connection
-func NewClickHouseStorage(cfg *config.Config) (*ClickHouseStorage, error) {
+func NewClickHouseStorage(cfg *config.Config, log *logger.Logger) (*ClickHouseStorage, error) {
 	// Use OpenDB with HTTP protocol (works with port 18123)
 	db := clickhouse.OpenDB(&clickhouse.Options{
 		Addr:     []string{cfg.ClickHouseAddr()},
@@ -50,8 +52,14 @@ func NewClickHouseStorage(cfg *config.Config) (*ClickHouseStorage, error) {
 		return nil, err
 	}
 
-	log.Printf("Connected to ClickHouse at %s", cfg.ClickHouseAddr())
-	return &ClickHouseStorage{db: db, cfg: cfg}, nil
+	if log != nil {
+		log.Info("Connected to ClickHouse",
+			"address", cfg.ClickHouseAddr(),
+			"database", cfg.ClickHouseDatabase,
+		)
+	}
+
+	return &ClickHouseStorage{db: db, cfg: cfg, logger: log}, nil
 }
 
 // InsertEvent inserts a single token usage event into ClickHouse
@@ -102,7 +110,12 @@ func (s *ClickHouseStorage) InsertBatch(ctx context.Context, events []*consumer.
 	for _, event := range events {
 		timestamp, err := parseTimestamp(event.Timestamp)
 		if err != nil {
-			log.Printf("Skipping event with invalid timestamp: trace_id=%s, error=%v", event.TraceID, err)
+			if s.logger != nil {
+				s.logger.Warn("Skipping event with invalid timestamp",
+					"trace_id", event.TraceID,
+					"error", err,
+				)
+			}
 			skippedCount++
 			continue
 		}
@@ -123,8 +136,11 @@ func (s *ClickHouseStorage) InsertBatch(ctx context.Context, events []*consumer.
 		)
 	}
 
-	if skippedCount > 0 {
-		log.Printf("Skipped %d events with invalid timestamps out of %d total", skippedCount, len(events))
+	if skippedCount > 0 && s.logger != nil {
+		s.logger.Warn("Skipped events with invalid timestamps",
+			"skipped_count", skippedCount,
+			"total_count", len(events),
+		)
 	}
 
 	// If all events were invalid, nothing to insert

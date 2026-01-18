@@ -4,6 +4,7 @@ go 1.21
 
 require (
 	github.com/ClickHouse/clickhouse-go/v2 v2.18.0
+	github.com/locobuzz-shoaib/cv-go-common-package v0.0.0-20260118182357-76f3e2ba3fb0
 	github.com/segmentio/kafka-go v0.4.47
 )
 

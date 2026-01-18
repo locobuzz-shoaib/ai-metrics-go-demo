@@ -31,8 +31,7 @@ type Config struct {
 	BatchTimeoutMs int
 
 	// Service configuration
-	HealthCheckPort int
-	LogLevel        string
+	LogLevel string
 }
 
 // AppSettings represents the JSON structure of appsettings.json
@@ -56,8 +55,7 @@ type AppSettings struct {
 		Size      int `json:"size"`
 		TimeoutMs int `json:"timeout_ms"`
 	} `json:"batch"`
-	HealthCheckPort int    `json:"health_check_port"`
-	LogLevel        string `json:"log_level"`
+	LogLevel string `json:"log_level"`
 }
 
 // LoadConfig loads configuration from appsettings.json
@@ -102,8 +100,7 @@ func LoadConfigFromFile(filePath string) (*Config, error) {
 		BatchTimeoutMs: settings.Batch.TimeoutMs,
 
 		// Service
-		HealthCheckPort: settings.HealthCheckPort,
-		LogLevel:        settings.LogLevel,
+		LogLevel: settings.LogLevel,
 	}
 
 	// Apply defaults if not set
@@ -120,9 +117,6 @@ func LoadConfigFromFile(filePath string) (*Config, error) {
 	}
 	if cfg.BatchTimeoutMs == 0 {
 		cfg.BatchTimeoutMs = 5000
-	}
-	if cfg.HealthCheckPort == 0 {
-		cfg.HealthCheckPort = 8080
 	}
 	if cfg.LogLevel == "" {
 		cfg.LogLevel = "info"
@@ -238,14 +232,6 @@ func (c *Config) Validate() error {
 		errors = append(errors, ValidationError{
 			Field:   "batch.timeout_ms",
 			Message: fmt.Sprintf("batch timeout must be positive, got: %d", c.BatchTimeoutMs),
-		})
-	}
-
-	// Validate health check port
-	if c.HealthCheckPort <= 0 || c.HealthCheckPort > 65535 {
-		errors = append(errors, ValidationError{
-			Field:   "health_check_port",
-			Message: fmt.Sprintf("invalid health check port: %d (must be 1-65535)", c.HealthCheckPort),
 		})
 	}
 
