@@ -32,16 +32,14 @@ WORKDIR /app
 # Copy binary from builder
 COPY --from=builder /build/creatorverse-ai-token-metrics-service .
 
+# Copy configuration file
+COPY appsettings.json .
+
 # Set ownership
 RUN chown -R appuser:appgroup /app
 
 USER appuser
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
-
 EXPOSE 8080
 
-# Config file should be mounted at /app/appsettings.json
 ENTRYPOINT ["./creatorverse-ai-token-metrics-service"]

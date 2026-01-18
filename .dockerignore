@@ -60,9 +60,8 @@ LICENSE
 *.md
 docs/
 
-# Configuration files (mounted at runtime)
-appsettings.json
-appsettings.*.json
+# Configuration files (example only, appsettings.json is copied to image)
+appsettings.example.json
 config/local.json
 config/development.json
 

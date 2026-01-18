@@ -3,7 +3,10 @@ package storage
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -13,14 +16,16 @@ import (
 
 // ClickHouseStorage handles storage of token usage events in ClickHouse
 type ClickHouseStorage struct {
-	conn clickhouse.Conn
-	cfg  *config.Config
+	db  *sql.DB
+	cfg *config.Config
 }
 
 // NewClickHouseStorage creates a new ClickHouse storage connection
 func NewClickHouseStorage(cfg *config.Config) (*ClickHouseStorage, error) {
-	conn, err := clickhouse.Open(&clickhouse.Options{
-		Addr: []string{cfg.ClickHouseAddr()},
+	// Use OpenDB with HTTP protocol (works with port 18123)
+	db := clickhouse.OpenDB(&clickhouse.Options{
+		Addr:     []string{cfg.ClickHouseAddr()},
+		Protocol: clickhouse.HTTP,
 		Auth: clickhouse.Auth{
 			Database: cfg.ClickHouseDatabase,
 			Username: cfg.ClickHouseUser,
@@ -29,38 +34,32 @@ func NewClickHouseStorage(cfg *config.Config) (*ClickHouseStorage, error) {
 		Settings: clickhouse.Settings{
 			"max_execution_time": 60,
 		},
-		DialTimeout:     10 * time.Second,
-		MaxOpenConns:    5,
-		MaxIdleConns:    5,
-		ConnMaxLifetime: time.Hour,
+		DialTimeout: 10 * time.Second,
 	})
-	if err != nil {
-		return nil, err
-	}
+
+	// Configure connection pool via sql.DB methods
+	db.SetMaxOpenConns(5)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(time.Hour)
 
 	// Verify connection
-	ctx := context.Background()
-	if err := conn.Ping(ctx); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := db.PingContext(ctx); err != nil {
 		return nil, err
 	}
 
 	log.Printf("Connected to ClickHouse at %s", cfg.ClickHouseAddr())
-	return &ClickHouseStorage{conn: conn, cfg: cfg}, nil
+	return &ClickHouseStorage{db: db, cfg: cfg}, nil
 }
 
 // InsertEvent inserts a single token usage event into ClickHouse
 func (s *ClickHouseStorage) InsertEvent(ctx context.Context, event *consumer.TokenUsageEvent) error {
 	// Parse timestamp
-	timestamp, err := time.Parse(time.RFC3339, event.Timestamp)
-	if err != nil {
-		// Try alternative ISO format
-		timestamp, err = time.Parse("2006-01-02T15:04:05.000Z", event.Timestamp)
-		if err != nil {
-			timestamp = time.Now()
-		}
-	}
+	timestamp := parseTimestamp(event.Timestamp)
 
-	return s.conn.Exec(ctx, `
+	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO ai_token_usage
 		(timestamp, provider, model_id, endpoint_name, input_tokens, output_tokens,
 		 total_tokens, cached_tokens, processing_time_ms, trace_id, environment)
@@ -77,6 +76,7 @@ func (s *ClickHouseStorage) InsertEvent(ctx context.Context, event *consumer.Tok
 		event.TraceID,
 		event.Environment,
 	)
+	return err
 }
 
 // InsertBatch inserts a batch of events into ClickHouse
@@ -85,26 +85,19 @@ func (s *ClickHouseStorage) InsertBatch(ctx context.Context, events []*consumer.
 		return nil
 	}
 
-	batch, err := s.conn.PrepareBatch(ctx, `
-		INSERT INTO ai_token_usage
+	// Build batch INSERT statement
+	query := `INSERT INTO ai_token_usage
 		(timestamp, provider, model_id, endpoint_name, input_tokens, output_tokens,
 		 total_tokens, cached_tokens, processing_time_ms, trace_id, environment)
-	`)
-	if err != nil {
-		return err
-	}
+		VALUES `
+
+	var values []string
+	var args []interface{}
 
 	for _, event := range events {
-		// Parse timestamp
-		timestamp, err := time.Parse(time.RFC3339, event.Timestamp)
-		if err != nil {
-			timestamp, err = time.Parse("2006-01-02T15:04:05.000Z", event.Timestamp)
-			if err != nil {
-				timestamp = time.Now()
-			}
-		}
-
-		err = batch.Append(
+		timestamp := parseTimestamp(event.Timestamp)
+		values = append(values, "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+		args = append(args,
 			timestamp,
 			event.Provider,
 			event.ModelID,
@@ -117,15 +110,52 @@ func (s *ClickHouseStorage) InsertBatch(ctx context.Context, events []*consumer.
 			event.TraceID,
 			event.Environment,
 		)
-		if err != nil {
-			return err
-		}
 	}
 
-	return batch.Send()
+	query += strings.Join(values, ", ")
+
+	_, err := s.db.ExecContext(ctx, query, args...)
+	return err
 }
 
 // Close closes the ClickHouse connection
 func (s *ClickHouseStorage) Close() error {
-	return s.conn.Close()
+	return s.db.Close()
+}
+
+// parseTimestamp parses a timestamp string into time.Time
+func parseTimestamp(ts string) time.Time {
+	timestamp, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		// Try alternative ISO format
+		timestamp, err = time.Parse("2006-01-02T15:04:05.000Z", ts)
+		if err != nil {
+			// Try format without timezone
+			timestamp, err = time.Parse("2006-01-02T15:04:05", ts)
+			if err != nil {
+				timestamp = time.Now()
+			}
+		}
+	}
+	return timestamp
+}
+
+// GetDB returns the underlying database connection (for testing)
+func (s *ClickHouseStorage) GetDB() *sql.DB {
+	return s.db
+}
+
+// HealthCheck verifies the database connection is alive
+func (s *ClickHouseStorage) HealthCheck(ctx context.Context) error {
+	return s.db.PingContext(ctx)
+}
+
+// GetVersion returns the ClickHouse server version
+func (s *ClickHouseStorage) GetVersion(ctx context.Context) (string, error) {
+	var version string
+	err := s.db.QueryRowContext(ctx, "SELECT version()").Scan(&version)
+	if err != nil {
+		return "", fmt.Errorf("failed to get version: %w", err)
+	}
+	return version, nil
 }
