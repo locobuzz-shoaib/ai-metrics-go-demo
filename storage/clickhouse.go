@@ -56,10 +56,13 @@ func NewClickHouseStorage(cfg *config.Config) (*ClickHouseStorage, error) {
 
 // InsertEvent inserts a single token usage event into ClickHouse
 func (s *ClickHouseStorage) InsertEvent(ctx context.Context, event *consumer.TokenUsageEvent) error {
-	// Parse timestamp
-	timestamp := parseTimestamp(event.Timestamp)
+	// Parse timestamp - fail if invalid
+	timestamp, err := parseTimestamp(event.Timestamp)
+	if err != nil {
+		return fmt.Errorf("invalid timestamp for event trace_id=%s: %w", event.TraceID, err)
+	}
 
-	_, err := s.db.ExecContext(ctx, `
+	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO ai_token_usage
 		(timestamp, provider, model_id, endpoint_name, input_tokens, output_tokens,
 		 total_tokens, cached_tokens, processing_time_ms, trace_id, environment)
@@ -80,6 +83,7 @@ func (s *ClickHouseStorage) InsertEvent(ctx context.Context, event *consumer.Tok
 }
 
 // InsertBatch inserts a batch of events into ClickHouse
+// Events with invalid timestamps are skipped and logged
 func (s *ClickHouseStorage) InsertBatch(ctx context.Context, events []*consumer.TokenUsageEvent) error {
 	if len(events) == 0 {
 		return nil
@@ -93,9 +97,16 @@ func (s *ClickHouseStorage) InsertBatch(ctx context.Context, events []*consumer.
 
 	var values []string
 	var args []interface{}
+	var skippedCount int
 
 	for _, event := range events {
-		timestamp := parseTimestamp(event.Timestamp)
+		timestamp, err := parseTimestamp(event.Timestamp)
+		if err != nil {
+			log.Printf("Skipping event with invalid timestamp: trace_id=%s, error=%v", event.TraceID, err)
+			skippedCount++
+			continue
+		}
+
 		values = append(values, "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
 		args = append(args,
 			timestamp,
@@ -112,6 +123,15 @@ func (s *ClickHouseStorage) InsertBatch(ctx context.Context, events []*consumer.
 		)
 	}
 
+	if skippedCount > 0 {
+		log.Printf("Skipped %d events with invalid timestamps out of %d total", skippedCount, len(events))
+	}
+
+	// If all events were invalid, nothing to insert
+	if len(values) == 0 {
+		return fmt.Errorf("all %d events had invalid timestamps, nothing to insert", len(events))
+	}
+
 	query += strings.Join(values, ", ")
 
 	_, err := s.db.ExecContext(ctx, query, args...)
@@ -124,20 +144,33 @@ func (s *ClickHouseStorage) Close() error {
 }
 
 // parseTimestamp parses a timestamp string into time.Time
-func parseTimestamp(ts string) time.Time {
-	timestamp, err := time.Parse(time.RFC3339, ts)
-	if err != nil {
-		// Try alternative ISO format
-		timestamp, err = time.Parse("2006-01-02T15:04:05.000Z", ts)
-		if err != nil {
-			// Try format without timezone
-			timestamp, err = time.Parse("2006-01-02T15:04:05", ts)
-			if err != nil {
-				timestamp = time.Now()
-			}
-		}
+// Returns an error if parsing fails - NO silent fallback to time.Now()
+func parseTimestamp(ts string) (time.Time, error) {
+	if ts == "" {
+		return time.Time{}, fmt.Errorf("empty timestamp string")
 	}
-	return timestamp
+
+	// Try RFC3339 first (most common)
+	if timestamp, err := time.Parse(time.RFC3339, ts); err == nil {
+		return timestamp, nil
+	}
+
+	// Try alternative ISO format with milliseconds
+	if timestamp, err := time.Parse("2006-01-02T15:04:05.000Z", ts); err == nil {
+		return timestamp, nil
+	}
+
+	// Try format without timezone
+	if timestamp, err := time.Parse("2006-01-02T15:04:05", ts); err == nil {
+		return timestamp, nil
+	}
+
+	// Try space-separated format
+	if timestamp, err := time.Parse("2006-01-02 15:04:05", ts); err == nil {
+		return timestamp, nil
+	}
+
+	return time.Time{}, fmt.Errorf("failed to parse timestamp: %s", ts)
 }
 
 // GetDB returns the underlying database connection (for testing)

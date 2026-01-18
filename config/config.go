@@ -113,12 +113,8 @@ func LoadConfigFromFile(filePath string) (*Config, error) {
 	if cfg.KafkaGroupID == "" {
 		cfg.KafkaGroupID = "token-metrics-consumer"
 	}
-	if cfg.ClickHousePort == 0 {
-		cfg.ClickHousePort = 9000
-	}
-	if cfg.ClickHouseDatabase == "" {
-		cfg.ClickHouseDatabase = "creatorverse"
-	}
+	// ClickHousePort and ClickHouseDatabase are required - no defaults
+	// Validation will catch missing values
 	if cfg.BatchSize == 0 {
 		cfg.BatchSize = 100
 	}
@@ -132,7 +128,132 @@ func LoadConfigFromFile(filePath string) (*Config, error) {
 		cfg.LogLevel = "info"
 	}
 
+	// Validate configuration
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("configuration validation failed: %w", err)
+	}
+
 	return cfg, nil
+}
+
+// ValidationError represents a configuration validation error
+type ValidationError struct {
+	Field   string
+	Message string
+}
+
+func (e ValidationError) Error() string {
+	return fmt.Sprintf("%s: %s", e.Field, e.Message)
+}
+
+// ValidationErrors is a collection of validation errors
+type ValidationErrors []ValidationError
+
+func (e ValidationErrors) Error() string {
+	if len(e) == 0 {
+		return ""
+	}
+	var msgs []string
+	for _, err := range e {
+		msgs = append(msgs, err.Error())
+	}
+	return strings.Join(msgs, "; ")
+}
+
+// Validate checks that all required configuration fields are set and valid
+func (c *Config) Validate() error {
+	var errors ValidationErrors
+
+	// Required fields - Kafka
+	if len(c.KafkaBrokers) == 0 || (len(c.KafkaBrokers) == 1 && c.KafkaBrokers[0] == "") {
+		errors = append(errors, ValidationError{
+			Field:   "kafka.bootstrap_servers",
+			Message: "at least one Kafka broker must be specified",
+		})
+	}
+
+	if c.KafkaTopic == "" {
+		errors = append(errors, ValidationError{
+			Field:   "kafka.topic",
+			Message: "Kafka topic is required",
+		})
+	}
+
+	// Validate Kafka broker format (basic check)
+	for i, broker := range c.KafkaBrokers {
+		if broker == "" {
+			continue
+		}
+		if !strings.Contains(broker, ":") {
+			errors = append(errors, ValidationError{
+				Field:   fmt.Sprintf("kafka.bootstrap_servers[%d]", i),
+				Message: fmt.Sprintf("broker should be in host:port format, got: %s", broker),
+			})
+		}
+	}
+
+	// Required fields - ClickHouse
+	if c.ClickHouseHost == "" {
+		errors = append(errors, ValidationError{
+			Field:   "clickhouse.host",
+			Message: "ClickHouse host is required",
+		})
+	}
+
+	if c.ClickHousePort == 0 {
+		errors = append(errors, ValidationError{
+			Field:   "clickhouse.port",
+			Message: "ClickHouse port is required",
+		})
+	} else if c.ClickHousePort < 0 || c.ClickHousePort > 65535 {
+		errors = append(errors, ValidationError{
+			Field:   "clickhouse.port",
+			Message: fmt.Sprintf("invalid port number: %d (must be 1-65535)", c.ClickHousePort),
+		})
+	}
+
+	if c.ClickHouseDatabase == "" {
+		errors = append(errors, ValidationError{
+			Field:   "clickhouse.database",
+			Message: "ClickHouse database is required",
+		})
+	}
+
+	// Validate batch configuration
+	if c.BatchSize <= 0 {
+		errors = append(errors, ValidationError{
+			Field:   "batch.size",
+			Message: fmt.Sprintf("batch size must be positive, got: %d", c.BatchSize),
+		})
+	}
+
+	if c.BatchSize > 10000 {
+		errors = append(errors, ValidationError{
+			Field:   "batch.size",
+			Message: fmt.Sprintf("batch size too large (max 10000), got: %d", c.BatchSize),
+		})
+	}
+
+	if c.BatchTimeoutMs <= 0 {
+		errors = append(errors, ValidationError{
+			Field:   "batch.timeout_ms",
+			Message: fmt.Sprintf("batch timeout must be positive, got: %d", c.BatchTimeoutMs),
+		})
+	}
+
+	// Validate health check port
+	if c.HealthCheckPort <= 0 || c.HealthCheckPort > 65535 {
+		errors = append(errors, ValidationError{
+			Field:   "health_check_port",
+			Message: fmt.Sprintf("invalid health check port: %d (must be 1-65535)", c.HealthCheckPort),
+		})
+	}
+
+	if len(errors) > 0 {
+		return errors
+	}
+
+	return nil
 }
 
 // ClickHouseAddr returns the full ClickHouse address (host:port)

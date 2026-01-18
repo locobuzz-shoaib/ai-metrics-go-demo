@@ -1,11 +1,19 @@
 $containerName = "creatorverse-ai-token-metrics-service"
 $imageName = "creatorverse-ai-token-metrics-service:1.0.0"
 
+# Parse arguments
+$noCache = $args -contains "--no-cache"
+
 Write-Host "Stopping and removing existing container..." -ForegroundColor Yellow
 docker rm -f $containerName 2>$null
 
-Write-Host "Building Docker image (no cache)..." -ForegroundColor Cyan
-docker build --no-cache -t ${imageName} -t creatorverse-ai-token-metrics-service:latest .
+if ($noCache) {
+    Write-Host "Building Docker image (no cache - full rebuild)..." -ForegroundColor Cyan
+    docker build --no-cache -t ${imageName} -t creatorverse-ai-token-metrics-service:latest .
+} else {
+    Write-Host "Building Docker image (with cache)..." -ForegroundColor Cyan
+    docker build -t ${imageName} -t creatorverse-ai-token-metrics-service:latest .
+}
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Build failed!" -ForegroundColor Red

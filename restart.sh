@@ -3,11 +3,22 @@
 CONTAINER_NAME="creatorverse-ai-token-metrics-service"
 IMAGE_NAME="creatorverse-ai-token-metrics-service:1.0.0"
 
+# Parse arguments
+NO_CACHE=""
+if [[ "$1" == "--no-cache" ]]; then
+    NO_CACHE="--no-cache"
+fi
+
 echo "Stopping and removing existing container..."
 docker rm -f $CONTAINER_NAME 2>/dev/null
 
-echo "Building Docker image (no cache)..."
-docker build --no-cache -t $IMAGE_NAME -t creatorverse-ai-token-metrics-service:latest .
+if [[ -n "$NO_CACHE" ]]; then
+    echo "Building Docker image (no cache - full rebuild)..."
+    docker build --no-cache -t $IMAGE_NAME -t creatorverse-ai-token-metrics-service:latest .
+else
+    echo "Building Docker image (with cache)..."
+    docker build -t $IMAGE_NAME -t creatorverse-ai-token-metrics-service:latest .
+fi
 
 if [ $? -ne 0 ]; then
     echo "Build failed!"
