@@ -1,0 +1,44 @@
+# Binaries
+creatorverse-ai-token-metrics-service
+token-metrics-service
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+
+# Output of go coverage
+*.out
+coverage.out
+
+# Dependency directories
+vendor/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+
+# Configuration files (contain secrets)
+appsettings.json
+appsettings.*.json
+!appsettings.example.json

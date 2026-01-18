@@ -1,0 +1,77 @@
+# Git and version control
+.git/
+.gitignore
+.gitattributes
+
+# Go build artifacts
+creatorverse-ai-token-metrics-service
+token-metrics-service
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+
+# Output of go coverage
+*.out
+coverage.out
+
+# Dependency directories
+vendor/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Docker files (to avoid recursive copying)
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# Documentation
+README.md
+CHANGELOG.md
+LICENSE
+*.md
+docs/
+
+# Configuration files (mounted at runtime)
+appsettings.json
+appsettings.*.json
+config/local.json
+config/development.json
+
+# Development scripts
+scripts/
+dev/
+development/
+
+# Plans and documentation
+plans/
+CLAUDE.md
+*.pdf
